@@ -2,8 +2,10 @@ from pydantic import BaseModel, Field
 from typing import Annotated, Literal
 from operator import add 
 
+
 class AgentSchema(BaseModel):
     messages : Annotated[list, add] = Field(..., description="List of messages to be processed by the agent")
+    user_question : str = Field(..., description="The original question asked by the user")
     curated_ques : str = Field(..., description="Curated question to be answered by the agent")
     prompt_query : str = Field(..., description="A detailed prompt with SQL DB context")
     is_safe : Literal["YES", "NO"] = Field(..., description="Indicates whether the generated SQL query is safe or not")
@@ -11,4 +13,3 @@ class AgentSchema(BaseModel):
     sql_query_execution_result : str = Field(..., description="The result of executing the generated SQL query on the database")
     final_answer : str = Field(..., description="The final answer provided by the agent after processing the messages and executing the SQL query")
 
-    
