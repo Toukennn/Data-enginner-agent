@@ -1,0 +1,16 @@
+[project]
+name = "data-enginner-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Toukennn", email = "amirrezakhatibi2009@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "dotenv>=0.9.9",
+    "langchain>=1.4.0",
+    "langchain-openai>=1.6.0",
+    "langgraph>=1.2.11",
+    "pydantic>=2.13.5",
+]
