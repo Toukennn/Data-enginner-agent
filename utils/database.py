@@ -74,7 +74,8 @@ class DatabaseUtil:
             cursor.execute(query)
             result = cursor.fetchall()
             connection.commit()
-            return str(result)
+            return str(result) # this is important since the result of fetchall() is a list 
+                               # but our result in the schema expects a string datatype! 
         except Exception as e:
             print(f"Error executing query: {e}")
             return None
@@ -109,4 +110,4 @@ if __name__ == "__main__":
     result = obj.schema_details("public")
 
     with open("test_schema_details_example.txt", "w") as f:
-        f.write(result)
+        f.write(result) # to test of the context has been generated correctly for the LLM

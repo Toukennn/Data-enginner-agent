@@ -23,5 +23,6 @@ def pick_llm(level: str):
 
     return llm
 
-# llm_obj = pick_llm("low")  # Example usage, you can change the level as needed
-# print(llm_obj.invoke("What is the capital of Switzerland?"))
+if __name__ == "__main__":
+    llm_obj = pick_llm("low")  # Example usage, you can change the level as needed
+    print(llm_obj.invoke("What is the capital of Switzerland?"))
