@@ -14,6 +14,11 @@ class AgentSchema(BaseModel):
     sql_query_execution_result : str = Field(..., description="The result of executing the generated SQL query on the database")
     final_answer : str = Field(..., description="The final answer provided by the agent after processing the messages and executing the SQL query")
 
+
 class JudgeSchema(BaseModel): 
     answer : Literal["YES", "NO"] = Field(..., description="Indicates whether the final answer provided by the agent is correct or not")
     comments : str = Field(..., description="Additional comments or feedback regarding the final answer provided by the agent")
+
+class ETLAgentSchema(BaseModel): 
+    messages: Annotated[list, add] = Field(..., description="List of messages to be procesed by the ETL agent")
+    

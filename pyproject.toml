@@ -12,6 +12,7 @@ dependencies = [
     "langchain>=1.4.0",
     "langchain-openai>=1.6.0",
     "langgraph>=1.2.11",
+    "pandas>=3.0.5",
     "psycopg2-binary>=2.9.12",
     "pydantic>=2.13.5",
     "python-dotenv>=1.2.3",
