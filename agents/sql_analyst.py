@@ -259,10 +259,10 @@ sql_agent_graph.add_edge("execute_sql", "represent_final_answer")
 sql_agent_graph.add_edge("represent_final_answer", END)
 
 # and now this agent is ready!!
-if __name__ == "__main__":
+# compiled at module level so other modules can `from SQL_analyst import sql_analyst`
+sql_analyst = sql_agent_graph.compile()
 
-    # COMPILE THE GRAPH: 
-    sql_analyst = sql_agent_graph.compile() # basically created the graph to be used next
+if __name__ == "__main__":
 
     # visualising the graph (optional):
     from IPython.display import display, Image

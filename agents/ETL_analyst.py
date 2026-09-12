@@ -118,7 +118,7 @@ def tool_node(state: ETLAgentSchema):
 
     for tool_call in tool_calls: 
         tool = tools_by_name[tool_call["name"]]
-        observation = tool.invoke(tool_call("args"))
+        observation = tool.invoke(tool_call["args"])
 
         tools_results.append(ToolMessage(content=observation, tool_call_id=tool_call["id"]))
 
@@ -159,13 +159,29 @@ etl_analyst_graph.add_conditional_edges(
 
 etl_analyst_graph.add_edge("tool_node", "llm_node")
 
+# we compile the graph here because we may need it for the data engineer agent
+etl_analyst = etl_analyst_graph.compile()
 
 if __name__ == "__main__":
-    # Compile the Graph
-    etl_analyst = etl_analyst_graph.compile()
     
     # Optional
     from IPython.display import display, Image
     img = Image(etl_analyst.get_graph().draw_mermaid_png())
     with open("etl_analyst_graph.png", "wb") as f:
         f.write(img.data)
+
+    # now let's check if it can extract data well 
+    # response = etl_analyst.invoke(
+    #    {"messages": [HumanMessage(content="I want to extract the data from the API endpoint 'https://pokeapi.co/api/v2/pokemon' and save it to data/extract folder in the csv format")]}
+    # )
+
+    # response = etl_analyst.invoke(
+    #    {"messages": [HumanMessage(content=rf"""
+    #                        I want to transform the data stored in the 'C:\Users\This PC\Desktop\Data engineer agent\Data-enginner-agent\data\extract\extracted_data.csv'
+    #                        path and save the transformed data in the C:\Users\This PC\Desktop\Data engineer agent\Data-enginner-agent\data\transform' folder in the
+    #                        csv format. the transformation should filter the data to show bulbasaur pokemon only.
+    #    """)]}
+    # )
+
+    # print(response)
+
