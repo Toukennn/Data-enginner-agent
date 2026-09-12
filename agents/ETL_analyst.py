@@ -2,7 +2,7 @@ from langchain.tools import tool
 from langchain_core.messages import ToolMessage
 from langgraph.graph import END, START, StateGraph
 
-from models.schema import ETLAgentSchema
+from models.schema import ETLAgentSchema, TransformPlan
 from utils.etl_tools import ETLTools
 from utils.llm_pick import pick_llm
 
@@ -53,101 +53,91 @@ def transform_load_tool(
     user_question: str = "",
 ) -> str:
     """
-    Transform an existing dataset according to the user's request
-    and save the result.
+    Safely transform an existing dataset according to the user's request.
+
+    The LLM creates a structured transformation plan.
+    The plan is validated with Pydantic and executed using deterministic
+    Pandas operations.
+
+    Arbitrary Python execution is not allowed.
 
     Args:
         input_file_path:
-            Path to the file that should be transformed.
+            Input dataset located inside the project's data directory.
 
         output_folder:
-            Folder where the transformed dataset should be saved.
-            Defaults to "data/transform".
+            Folder inside the data directory where the transformed
+            dataset should be saved.
 
         output_format:
-            Output format.
-            Supported values: csv, json, parquet.
+            csv, json, or parquet.
 
         user_question:
-            Natural-language description of the requested transformation.
+            Natural-language transformation request.
 
     Returns:
-        A message describing the transformation and its result.
+        Description of the executed transformation.
     """
 
     etl_tools = ETLTools()
 
-    # Give the LLM some context about the dataset
-    dataset_context = etl_tools.transform_load_context(
-        input_file_path
+    dataset_context = (
+        etl_tools.get_dataset_context(
+            input_file_path
+        )
     )
 
-    transformation_llm = pick_llm("claude")
+    planner_llm = (
+        pick_llm("claude")
+        .with_structured_output(
+            TransformPlan
+        )
+    )
 
     prompt = f"""
-You are a Python data transformation specialist.
+You are an ETL transformation planner.
 
-Your task is to generate Pandas code that transforms an existing dataset
-according to the user's request.
+Your job is NOT to write Python code.
 
-Input file:
-{input_file_path}
+Instead, create a structured transformation plan using only
+the transformation operations available in the provided schema.
 
-Output folder:
-{output_folder}
-
-Requested output format:
-{output_format}
+The plan will later be executed by trusted deterministic Python code.
 
 User request:
+
 {user_question}
 
-Dataset preview:
+
+Dataset metadata:
+
 {dataset_context}
 
-Requirements:
 
-1. Load the dataset from the input file.
-2. Perform only the transformations required by the user.
-3. Save the transformed result inside:
-   {output_folder}
-4. Save it using this format:
-   {output_format}
-5. Return ONLY valid Python/Pandas code.
-6. Do not include Markdown code fences.
-7. Do not include explanations.
+Important rules:
+
+- Never generate Python code.
+- Never generate shell commands.
+- Never attempt file-system operations.
+- Never invent column names.
+- Only use columns present in the dataset metadata.
+- Use the minimum number of transformation operations needed.
+- Preserve columns unless the user explicitly requests otherwise.
+- Operations are executed in the exact order you provide them.
+- If type conversion is required before a comparison or aggregation,
+  place the cast operation before that operation.
+- The summary should briefly describe the transformation.
 """
 
-    response = transformation_llm.invoke(prompt)
-
-    pandas_code = response.content.strip()
-
-    # Remove accidental Markdown fences if the model still produces them
-    if pandas_code.startswith("```python"):
-        pandas_code = pandas_code[len("```python"):]
-
-    elif pandas_code.startswith("```"):
-        pandas_code = pandas_code[len("```"):]
-
-    if pandas_code.endswith("```"):
-        pandas_code = pandas_code[:-3]
-
-    pandas_code = pandas_code.strip()
-
-    # NOTE:
-    # This still executes LLM-generated code.
-    # We will replace this with a safer transformation architecture
-    # in Step 1B.
-    execution_result = etl_tools.execute_code(
-        pandas_code
+    plan = planner_llm.invoke(
+        prompt
     )
 
-    return (
-        f"Transformation request processed.\n\n"
-        f"Output folder: {output_folder}\n"
-        f"Output format: {output_format}\n\n"
-        f"Execution result:\n{execution_result}\n\n"
-        f"Generated Pandas code:\n{pandas_code}"
+    return etl_tools.transform_load(
+        input_file_path=input_file_path,
+        output_folder=output_folder,
+        output_format=output_format,
+        plan=plan,
     )
 
 
