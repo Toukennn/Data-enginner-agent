@@ -1,4 +1,4 @@
-from agents.data_engineer import data_agent
+from agents.data_engineer import data_engineer
 from langchain_core.messages import HumanMessage
 
 if __name__ == "__main__":
