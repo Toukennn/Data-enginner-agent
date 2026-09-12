@@ -1,296 +1,565 @@
-import os 
-import sys
+from langchain_core.messages import AIMessage
+from langgraph.graph import END, START, StateGraph
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-from utils.llm_pick import pick_llm
-from utils.database import DatabaseUtil
 from models.schema import AgentSchema, JudgeSchema
-from langchain_core.messages import HumanMessage, AIMessage
-from langgraph.graph import StateGraph, START, END
+from utils.database import DatabaseUtil, load_database_config
+from utils.llm_pick import pick_llm
 
 
-# -------------- AI AGENT Code -------------------
-def curated_ques(state: AgentSchema) -> AgentSchema: 
+# ============================================================
+# HELPERS
+# ============================================================
+
+def clean_sql_output(sql: str) -> str:
     """
-    Curates the question based on the messages and context provided in the state.
+    Clean SQL returned by an LLM.
+
+    Removes accidental Markdown code fences such as:
+
+        ```sql
+        SELECT ...
+        ```
+
     Args:
-        state (AgentSchema): The current state of the agent containing messages and context.
+        sql:
+            Raw SQL text returned by the LLM.
 
     Returns:
-        AgentSchema: Updated state with curated question.
+        Clean SQL string ready for validation/execution.
     """
 
-    user_question = state.user_question # the dot notation is used since it is a Pydantic model object
+    sql = sql.strip()
+
+    if sql.startswith("```sql"):
+        sql = sql[len("```sql"):]
+
+    elif sql.startswith("```"):
+        sql = sql[len("```"):]
+
+    if sql.endswith("```"):
+        sql = sql[:-3]
+
+    return sql.strip()
+
+
+def get_database() -> DatabaseUtil:
+    """
+    Create a DatabaseUtil instance using environment configuration.
+    """
+
+    config = load_database_config()
+
+    return DatabaseUtil(config)
+
+
+# ============================================================
+# NODE 1 — CURATE USER QUESTION
+# ============================================================
+
+def curate_question(state: AgentSchema):
+    """
+    Rewrite the user's question into a clearer form while preserving
+    the original intent.
+
+    The curated question is internal workflow state and should NOT
+    be added to the conversation history.
+    """
+
     llm = pick_llm("low")
-    response = llm.invoke(f"Curate the following question: {user_question}").content
-    state.curated_ques = response
-    state.messages = state.messages + [HumanMessage(content=f"{response}")] # Append the LLM's response to the messages
-    # note that we have already used "add" when defining messages in our schema, so 
-    # it would be added to the list automatically even if you don't append it to the list 
-    # explicitly, but to make the code more readable, we append it here anyway!
 
-    return state
+    prompt = f"""
+You are assisting an SQL analyst.
 
+Rewrite the following user question so that it is clear, precise,
+and suitable for generating a PostgreSQL query.
 
-def prompt_query(state: AgentSchema) -> AgentSchema: 
-    """
-    Generates a detailed prompt with SQL DB context based on the curated question.
-    Args:
-        state (AgentSchema): The current state of the agent containing messages and context.
+Important rules:
 
-    Returns:
-        AgentSchema: Updated state with prompt query context.
-    """
+- Preserve the user's original meaning.
+- Do not invent filters, columns, tables, dates, or conditions.
+- Do not answer the question.
+- Do not generate SQL.
+- Return only the rewritten question.
 
-    curated_ques = state.curated_ques
+User question:
 
-    conn_details = {
-        "host": os.getenv("host"),
-        "user": os.getenv("user"), 
-        "password": os.getenv("password"),
-        "dbname": os.getenv("database"),
-        "port": int(os.getenv("port", "5432"))
+{state.user_question}
+"""
+
+    response = llm.invoke(prompt)
+
+    return {
+        "curated_ques": response.content.strip()
     }
 
-    obj = DatabaseUtil(conn_details)
 
-    schema_info = obj.schema_details("public") # Assuming the schema is public, you can modify this as needed
+# ============================================================
+# NODE 2 — CREATE SQL PROMPT WITH DATABASE CONTEXT
+# ============================================================
 
-    # now you should give the llm a very detailed prompt based on the concepts of 
-    # Prompt Engineering! 
-    prompt = f"""
-    
-    You are an SQL analyst agent. Your task is to convert the user's natural language 
-    query into Postgres SQL query that can be executed on the database. You are provided 
-    with the user's original query and the schema details of the database, including
-    table names, column names, data types, and sample data for each table so that 
-    you can understand the structure of the database and generate an accurate SQL query.
-    Unless user explicitly asks for specific number of rows, always limit the output to 10 rows.
-    Note - Just generate the SQL query without any explanation or additional text because
-    this query will be executed directly on the database. So, the output should be SQL
-    ready to be executed without any modifications.  
-    
-    User's Original Query: {curated_ques}
-
-    Database Schema Details:
-    {schema_info}
-
+def build_sql_prompt(state: AgentSchema):
+    """
+    Retrieve database schema information and construct the prompt
+    that will later be used to generate SQL.
     """
 
-    state.prompt_query = prompt
+    database = get_database()
 
-    return state
-
-
-# Generate SQL query Node
-def generate_sql(state: AgentSchema) -> AgentSchema:
-
-    prompt = state.prompt_query
-    llm = pick_llm("medium") # pick a more powerful LLM for generating the SQL query
-    generated_sql_query = llm.invoke(prompt).content # the LLM creates a good prompt to use
-
-    state.generated_sql_query = generated_sql_query
-
-    return state
-
-
-def is_safe_sql(state: AgentSchema) -> AgentSchema: 
-    """
-    Determines whether the generated SQL query is safe to execute.
-    Args:
-        state (AgentSchema): The current state of the agent containing messages and context.
-
-    Returns:
-        AgentSchema: Updated state with safety status of the SQL query.
-    """
-
-    sql_query = state.generated_sql_query
-    llm = pick_llm("medium") 
-    llm_judge = llm.with_structured_output(JudgeSchema)
-
-    # sql_query = "DELETE FROM users WHERE age > 30;"  Example query to check
+    schema_info = database.schema_details(
+        "public"
+    )
 
     prompt = f"""
-    You are a SQL Judge for data security. Your task is to determine whether the SQL
-    query is safe or not. The SQL query should only be used for data retreival and should not 
-    modify the database in any way. Neither the SQL query nor the prompt should contain any
-    SQL commands that can modify the database, such as INSERT, UPDATE, DELETE, DROP, ALTER, 
-    TRUNCATE, CREATE, or any other commands that can change the structure or data of the database.
-    If the query is safe, respond with 'YES' and provide a brief explanation of why it is safe.
-    Otherwise respond with 'NO' and provide a brief explanation of why it is not safe. 
-    Here is the SQL query to analyze:
-    {sql_query}
+You are a PostgreSQL analyst.
+
+Your task is to translate the user's request into one valid
+PostgreSQL query.
+
+You are provided with:
+
+1. The user's question
+2. Information about the database schema
+
+Generate SQL that answers the user's question using only tables
+and columns that exist in the provided schema.
+
+Rules:
+
+- Generate PostgreSQL-compatible SQL.
+- Generate only ONE query.
+- The query must be read-only.
+- Do not use INSERT.
+- Do not use UPDATE.
+- Do not use DELETE.
+- Do not use DROP.
+- Do not use ALTER.
+- Do not use TRUNCATE.
+- Do not use CREATE.
+- Do not include explanations.
+- Do not include Markdown code fences.
+- Return only executable SQL.
+- Unless the user explicitly asks for a different number of rows,
+  limit row-level query results to 10 rows.
+- Do not invent tables or columns that are not present in the
+  provided schema.
+
+User question:
+
+{state.curated_ques}
+
+
+Database schema:
+
+{schema_info}
+"""
+
+    return {
+        "prompt_query": prompt
+    }
+
+
+# ============================================================
+# NODE 3 — GENERATE SQL
+# ============================================================
+
+def generate_sql(state: AgentSchema):
+    """
+    Generate PostgreSQL from the prepared database-aware prompt.
     """
 
-    response = llm_judge.invoke(prompt).model_dump() # This way we get the output as a dictionary
-    state.is_safe = response['answer']
-    state.comments = response['comments']
+    llm = pick_llm("medium")
 
-    return state
+    response = llm.invoke(
+        state.prompt_query
+    )
+
+    generated_sql = clean_sql_output(
+        response.content
+    )
+
+    return {
+        "generated_sql_query": generated_sql
+    }
 
 
-# Cancel SQL query node
-def canceled_sql(state: AgentSchema) -> AgentSchema: 
+# ============================================================
+# NODE 4 — SAFETY JUDGE
+# ============================================================
+
+def check_sql_safety(state: AgentSchema):
     """
-    Cancels the SQL query execution if it is deemed unsafe and specifies a reason for it.
-    Args:
-        state (AgentSchema): The current state of the agent containing messages and context.
+    Ask an LLM judge whether the generated SQL is read-only.
 
-    Returns:
-        AgentSchema: Updated state indicating that the SQL query execution has been canceled.
-    """
+    NOTE:
+    This is currently only one safety layer.
 
-    comments = state.comments
-    state.final_answer = f"SQL query execution has been canceled due to safety concerns. Reason provided by the judge: {comments}"
-    state.messages = state.messages + [AIMessage(content=f"{state.final_answer}")]
-
-    return state 
-
-
-# Execute SQL query node
-def execute_sql(state: AgentSchema) -> AgentSchema: 
-    """
-    Executes the generated SQL query on the database and stores the result.
-    Args:
-        state (AgentSchema): The current state of the agent containing messages and context.
-
-    Returns:
-        AgentSchema: Updated state with the result of executing the SQL query.
+    Later we should replace/augment this with deterministic SQL
+    parsing and database-level read-only permissions.
     """
 
     sql_query = state.generated_sql_query
 
-    conn_details = {
-        "host": os.getenv("host"),
-        "user": os.getenv("user"),
-        "password": os.getenv("password"),
-        "dbname": os.getenv("database"),
-        "port": int(os.getenv("port", "5432"))
-    }
+    llm = pick_llm("medium")
 
-    obj = DatabaseUtil(conn_details) 
-    execution_result = obj.execute_sql(sql_query) # function in our database.py script using cursor
-
-    state.sql_query_execution_result = execution_result
-
-    return state
-
-
-
-# Represent the final answer Node
-def represent_final_answer(state: AgentSchema) -> AgentSchema: 
-    """
-    Represents the final answer based on the execution result of the SQL query.
-    Args:
-        state (AgentSchema): The current state of the agent containing messages and context.
-
-    Returns:
-        AgentSchema: Updated state with the final answer.
-    """
-
-    execution_result = state.sql_query_execution_result
-    curated_ques = state.curated_ques
-
-    llm = pick_llm("low") # pick a less powerful LLM for representing the final answer
+    safety_llm = llm.with_structured_output(
+        JudgeSchema
+    )
 
     prompt = f"""
-    You are an SQL analyst agent. Your task is to provide a final answer based on the
-    execution result of the SQL query and the user's original question. The final answer should
-    be concise, clear and directly address the user's query. Avoid including any SQL code or
-    technical details in the final answer. The final answer should be in a user-friendly format
-    that is easy to understand. If the execution result is empty or does not provide a clear
-    answer to the user's question, explain this in the final answer\n.
+You are a PostgreSQL query safety reviewer.
 
-    The SQL query was: {curated_ques} \n 
-    The execution result is: {execution_result}
+Determine whether the following SQL query is safe to execute
+against a production-style analytical database.
+
+A safe query must be READ-ONLY.
+
+Safe examples include:
+
+- SELECT
+- SELECT with JOIN
+- SELECT with GROUP BY
+- SELECT with aggregate functions
+- SELECT with CTEs that are themselves read-only
+
+Unsafe SQL includes anything that modifies data, database
+structure, configuration, users, permissions, or transactions.
+
+Reject queries containing or performing operations such as:
+
+- INSERT
+- UPDATE
+- DELETE
+- DROP
+- ALTER
+- TRUNCATE
+- CREATE
+- GRANT
+- REVOKE
+- COPY TO/FROM in unsafe contexts
+- CALL
+- DO
+- transaction manipulation
+- multiple SQL statements where one may be unsafe
+
+Return:
+
+answer = "YES"
+
+only if the query is read-only.
+
+Otherwise return:
+
+answer = "NO"
+
+Also provide a short explanation.
+
+SQL query:
+
+{sql_query}
+"""
+
+    result = safety_llm.invoke(
+        prompt
+    )
+
+    return {
+        "is_safe": result.answer,
+        "comments": result.comments,
+    }
+
+
+# ============================================================
+# NODE 5A — CANCEL UNSAFE SQL
+# ============================================================
+
+def cancel_sql(state: AgentSchema):
+    """
+    Stop execution when the generated SQL is considered unsafe.
     """
 
-    llm_response = llm.invoke(prompt).content # this way we get only the final asnwer from the LLM
+    final_answer = (
+        "The generated SQL query was not executed because it "
+        "failed the safety check. "
+        f"Reason: {state.comments}"
+    )
 
-    state.final_answer = llm_response
-    state.messages = state.messages + [AIMessage(content=f"{llm_response}")] 
-    # we append the final answer to the messages list in our schema
+    return {
+        "final_answer": final_answer,
+        "messages": [
+            AIMessage(
+                content=final_answer
+            )
+        ],
+    }
 
-    return state
+
+# ============================================================
+# NODE 5B — EXECUTE SAFE SQL
+# ============================================================
+
+def execute_sql(state: AgentSchema):
+    """
+    Execute SQL that passed the current safety check.
+    """
+
+    database = get_database()
+
+    try:
+        result = database.execute_sql(
+            state.generated_sql_query
+        )
+
+        if result is None:
+            result = (
+                "The SQL query could not be executed "
+                "successfully."
+            )
+
+    except Exception as exc:
+
+        result = (
+            f"SQL execution failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    return {
+        "sql_query_execution_result": str(result)
+    }
 
 
-# now, all the nodes of our graph are created, we should now add the edges of our graph!
+# ============================================================
+# NODE 6 — CREATE USER-FRIENDLY ANSWER
+# ============================================================
 
-# GRAPH BUILDING:
-sql_agent_graph = StateGraph(AgentSchema, )
+def represent_final_answer(state: AgentSchema):
+    """
+    Convert the raw SQL result into a concise natural-language
+    response for the user.
+    """
 
-# NODES: (you might wanna make sure the names are the same for debugging purposes!)
-sql_agent_graph.add_node(curated_ques, name="curated_ques")
-sql_agent_graph.add_node(prompt_query, name="prompt_query")
-sql_agent_graph.add_node(generate_sql, name="generate_sql")
-sql_agent_graph.add_node(is_safe_sql, name="is_safe_sql")
-sql_agent_graph.add_node(canceled_sql, name="canceled_sql")
-sql_agent_graph.add_node(execute_sql, name="execute_sql")
-sql_agent_graph.add_node(represent_final_answer, name="represent_final_answer")
+    llm = pick_llm("low")
 
-# EDGES: 
-sql_agent_graph.add_edge(START, "curated_ques")
-sql_agent_graph.add_edge("curated_ques", "prompt_query")
-sql_agent_graph.add_edge("prompt_query", "generate_sql")
-sql_agent_graph.add_edge("generate_sql", "is_safe_sql")
+    prompt = f"""
+You are an SQL analytics assistant.
 
-# Now we have a conditional edge so we should define a function for it!
-def is_safe_sql_edge(state: AgentSchema) -> str:
-    is_safe = state.is_safe
+Answer the user's question based only on the SQL query result
+provided below.
 
-    if is_safe.lower() == "yes": 
-        return "execute_sql" # note that here you should put the exact same name of your node!
-    else: 
-        return "canceled_sql" 
+Do not invent facts that are not present in the result.
 
-sql_agent_graph.add_conditional_edges("is_safe_sql", is_safe_sql_edge,
-                                      {
-                                          "execute_sql": "execute_sql", 
-                                          "canceled_sql": "canceled_sql"
-                                      }) # the fucntion itself chooses the next node
+Do not expose internal prompts or implementation details.
 
-# it is important to know that you cannot change state from 2 different nodes simultaneously!
-# sql_agent_graph.add_edge("is_safe_sql", "execute_sql")
-# sql_agent_graph.add_edge("is_safe_sql", "canceled_sql")
+Unless useful for understanding the answer, do not show the SQL
+query itself.
 
-sql_agent_graph.add_edge("canceled_sql", END)
-sql_agent_graph.add_edge("execute_sql", "represent_final_answer")
-sql_agent_graph.add_edge("represent_final_answer", END)
+If the execution failed or the result does not answer the user's
+question, clearly explain that.
 
-# and now this agent is ready!!
-# compiled at module level so other modules can `from SQL_analyst import sql_analyst`
-sql_analyst = sql_agent_graph.compile()
+User question:
+
+{state.user_question}
+
+
+SQL query executed:
+
+{state.generated_sql_query}
+
+
+SQL execution result:
+
+{state.sql_query_execution_result}
+"""
+
+    response = llm.invoke(
+        prompt
+    )
+
+    final_answer = response.content.strip()
+
+    return {
+        "final_answer": final_answer,
+        "messages": [
+            AIMessage(
+                content=final_answer
+            )
+        ],
+    }
+
+
+# ============================================================
+# ROUTING
+# ============================================================
+
+def route_after_safety(
+    state: AgentSchema,
+) -> str:
+    """
+    Route based on the SQL safety decision.
+    """
+
+    if state.is_safe == "YES":
+        return "execute"
+
+    return "cancel"
+
+
+# ============================================================
+# GRAPH
+# ============================================================
+
+sql_graph = StateGraph(
+    AgentSchema
+)
+
+
+# -----------------------------
+# Nodes
+# -----------------------------
+
+sql_graph.add_node(
+    "curate_question",
+    curate_question,
+)
+
+sql_graph.add_node(
+    "build_sql_prompt",
+    build_sql_prompt,
+)
+
+sql_graph.add_node(
+    "generate_sql",
+    generate_sql,
+)
+
+sql_graph.add_node(
+    "check_sql_safety",
+    check_sql_safety,
+)
+
+sql_graph.add_node(
+    "cancel_sql",
+    cancel_sql,
+)
+
+sql_graph.add_node(
+    "execute_sql",
+    execute_sql,
+)
+
+sql_graph.add_node(
+    "represent_final_answer",
+    represent_final_answer,
+)
+
+
+# -----------------------------
+# Main workflow
+# -----------------------------
+
+sql_graph.add_edge(
+    START,
+    "curate_question",
+)
+
+sql_graph.add_edge(
+    "curate_question",
+    "build_sql_prompt",
+)
+
+sql_graph.add_edge(
+    "build_sql_prompt",
+    "generate_sql",
+)
+
+sql_graph.add_edge(
+    "generate_sql",
+    "check_sql_safety",
+)
+
+
+# -----------------------------
+# Safety routing
+# -----------------------------
+
+sql_graph.add_conditional_edges(
+    "check_sql_safety",
+    route_after_safety,
+    {
+        "execute": "execute_sql",
+        "cancel": "cancel_sql",
+    },
+)
+
+
+# -----------------------------
+# Successful execution path
+# -----------------------------
+
+sql_graph.add_edge(
+    "execute_sql",
+    "represent_final_answer",
+)
+
+sql_graph.add_edge(
+    "represent_final_answer",
+    END,
+)
+
+
+# -----------------------------
+# Unsafe query path
+# -----------------------------
+
+sql_graph.add_edge(
+    "cancel_sql",
+    END,
+)
+
+
+# ============================================================
+# COMPILE GRAPH
+# ============================================================
+
+sql_analyst = sql_graph.compile()
+
+
+# ============================================================
+# LOCAL TEST
+# ============================================================
 
 if __name__ == "__main__":
 
-    # visualising the graph (optional):
-    from IPython.display import display, Image
-    img = Image(sql_analyst.get_graph().draw_mermaid_png())
-    with open("sql_analyst_graph.png", "wb") as f: 
-        f.write(img.data)
-
-    input_schema = { # should be the same as AgentSchema be careful!
-        "messages": [], 
-        "user_question": "What are the different types of Payment Methods we have in out database?", 
-        "curated_ques": "", 
-        "prompt_query": "", 
-        "generated_sql_query": "", 
-        "is_safe": "NO", 
-        "comments": "", 
-        "sql_query_execution_result": "", 
-        "final_answer": ""
+    test_input = {
+        "user_question": (
+            "What are the different payment methods "
+            "available in the database?"
+        )
     }
 
-    # Execute the graph 
-    sql_analyst_response = sql_analyst.invoke(input_schema) 
-    # be careful that the name you choose for .execute() should be the same as the one you
-    # choose to get compiled (.compile())
+    result = sql_analyst.invoke(
+        test_input
+    )
 
-    print(sql_analyst_response['messages'])
-    print("***************************")
-    print(sql_analyst_response['generated_sql_query'])
-    print("***************************")
-    print(sql_analyst_response['sql_query_execution_result'])
-    print("***************************")
-    print(sql_analyst_response['prompt_query'])
+    print(
+        "\n--- Generated SQL ---\n"
+    )
+
+    print(
+        result["generated_sql_query"]
+    )
+
+    print(
+        "\n--- Execution Result ---\n"
+    )
+
+    print(
+        result["sql_query_execution_result"]
+    )
+
+    print(
+        "\n--- Final Answer ---\n"
+    )
+
+    print(
+        result["final_answer"]
+    )

@@ -1,189 +1,402 @@
-import os 
-import sys 
+from langchain.tools import tool
+from langchain_core.messages import ToolMessage
+from langgraph.graph import END, START, StateGraph
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-from utils.llm_pick import pick_llm
-from utils.ETL_tools import ETLTools
 from models.schema import ETLAgentSchema
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
-from langgraph.graph import StateGraph, START, END
-from langchain.tools import tool 
+from utils.etl_tools import ETLTools
+from utils.llm_pick import pick_llm
 
-# Let's start implementing the ETL Agent! 
+
+# ============================================================
+# TOOLS
+# ============================================================
 
 @tool
-def extract_load_tool (url: str, output_folder: str, format: str) -> str: 
+def extract_load_tool(
+    url: str,
+    output_folder: str = "data/extract",
+    format: str = "csv",
+) -> str:
     """
-    This tool extracts the data from the API (url) and loads it into the
-    the desired location (output_folder).
+    Extract data from an API endpoint and save it locally.
 
     Args:
-        url (str): The API endpoint from which to extract data.
-        output_folder (str): The folder where the extracted data will be saved.
-        format (str): the format in which to save the extracted data (csv, json, parquet)
-    
+        url:
+            API endpoint from which data should be extracted.
+
+        output_folder:
+            Folder where the extracted data should be saved.
+            Defaults to "data/extract".
+
+        format:
+            Output format.
+            Supported values: csv, json, parquet.
+
     Returns:
-        str: A message indicating the success or failure of the operation.
+        A message describing whether the extraction succeeded or failed.
     """
 
     etl_tools = ETLTools()
-    return etl_tools.extract_load(url, output_folder, format)
 
+    return etl_tools.extract_load(
+        url=url,
+        output_folder=output_folder,
+        format=format,
+    )
 
 
 @tool
-def transform_load_tool(input_file_path:str,output_folder:str,output_format:str, user_question:str) -> str:
+def transform_load_tool(
+    input_file_path: str,
+    output_folder: str = "data/transform",
+    output_format: str = "csv",
+    user_question: str = "",
+) -> str:
     """
-    This tool transforms the data from the specified file and loads it into the
-    desired location (output_folder).
+    Transform an existing dataset according to the user's request
+    and save the result.
 
     Args:
-        input_file_path (str): The path to the file containing the data to be transformed.
-        output_folder (str): The folder where the transformed data will be saved.
-        output_format (str): The format in which to save the transformed data (csv, json, parquet).
-    
-    Returns:
-        str: A message indicating the success or failure of the operation.
+        input_file_path:
+            Path to the file that should be transformed.
 
+        output_folder:
+            Folder where the transformed dataset should be saved.
+            Defaults to "data/transform".
+
+        output_format:
+            Output format.
+            Supported values: csv, json, parquet.
+
+        user_question:
+            Natural-language description of the requested transformation.
+
+    Returns:
+        A message describing the transformation and its result.
     """
+
     etl_tools = ETLTools()
 
-    top_3_rows = etl_tools.transform_load_context(input_file_path)
+    # Give the LLM some context about the dataset
+    dataset_context = etl_tools.transform_load_context(
+        input_file_path
+    )
 
-    llm = pick_llm("claude") # claude performs well as an interpretor
-
-    prompt = f"""
-            You are a Python Data Analyst who uses Pandas to analyze data. 
-            You need to provide only the Pandas Code that will help to perform the right ETL operations on the data stored in the file : {input_file_path}
-            as per the user's question. Do not provide any explanation or comments, only
-            the code should be provided. The code should be in a format that can be executed 
-            in a Python environment with Pandas installed. 
-            Don't write anything else than Pandas Code. \n
-            
-            Create the Pandas Dataframe from the data stored in the file : {input_file_path} and then 
-            write the code to transform and save the data at {output_folder}.
-            Here's the user's question: {user_question}\n
-            Here's the context of the data you will be analyzing: {top_3_rows}\n
-
-        """
-
-    response = llm.invoke(prompt).content 
-
-    # Optional Cleaning (so that the code can be executed)
-    pandas_code = response.strip().strip('```').strip().lstrip('python').strip() 
-
-    # Execute the Pandas code
-    results = etl_tools.execute_code(pandas_code)
-
-    # informing the agent about the work done
-    return f"The data is transformed and saved at {output_folder} in {output_format} format. \n\n Pandas Code Executed: \n {pandas_code} \n\n Execution Result: \n {results}"
-
-
-# toolkit (list of the tools that we will provide to the LLM)
-tools = [extract_load_tool, transform_load_tool]
-
-llm = pick_llm("claude") # we pick the agent outside once more to give it the tools
-llm_bind = llm.bind_tools(tools)
-
-
-# not it's time to create the graph 
-
-def llm_node(state: ETLAgentSchema): 
-    messages = state.messages
+    transformation_llm = pick_llm("claude")
 
     prompt = f"""
-            You are a Python Data Analyst who has access to tools that can extract and load, 
-            transform and load data. You will be provided with a user's question 
-            and you would need to perform the right ETL operations as per the user's question. 
-            If the operation is performed then inform the user and end the coversation.
-            Here's the chat history: {messages}\n
+You are a Python data transformation specialist.
+
+Your task is to generate Pandas code that transforms an existing dataset
+according to the user's request.
+
+Input file:
+{input_file_path}
+
+Output folder:
+{output_folder}
+
+Requested output format:
+{output_format}
+
+User request:
+{user_question}
+
+Dataset preview:
+{dataset_context}
+
+Requirements:
+
+1. Load the dataset from the input file.
+2. Perform only the transformations required by the user.
+3. Save the transformed result inside:
+   {output_folder}
+4. Save it using this format:
+   {output_format}
+5. Return ONLY valid Python/Pandas code.
+6. Do not include Markdown code fences.
+7. Do not include explanations.
+"""
+
+    response = transformation_llm.invoke(prompt)
+
+    pandas_code = response.content.strip()
+
+    # Remove accidental Markdown fences if the model still produces them
+    if pandas_code.startswith("```python"):
+        pandas_code = pandas_code[len("```python"):]
+
+    elif pandas_code.startswith("```"):
+        pandas_code = pandas_code[len("```"):]
+
+    if pandas_code.endswith("```"):
+        pandas_code = pandas_code[:-3]
+
+    pandas_code = pandas_code.strip()
+
+    # NOTE:
+    # This still executes LLM-generated code.
+    # We will replace this with a safer transformation architecture
+    # in Step 1B.
+    execution_result = etl_tools.execute_code(
+        pandas_code
+    )
+
+    return (
+        f"Transformation request processed.\n\n"
+        f"Output folder: {output_folder}\n"
+        f"Output format: {output_format}\n\n"
+        f"Execution result:\n{execution_result}\n\n"
+        f"Generated Pandas code:\n{pandas_code}"
+    )
+
+
+# ============================================================
+# TOOLKIT
+# ============================================================
+
+tools = [
+    extract_load_tool,
+    transform_load_tool,
+]
+
+tools_by_name = {
+    tool.name: tool
+    for tool in tools
+}
+
+
+# ============================================================
+# LLM
+# ============================================================
+
+etl_llm = pick_llm("claude")
+
+etl_llm_with_tools = etl_llm.bind_tools(
+    tools
+)
+
+
+# ============================================================
+# GRAPH NODES
+# ============================================================
+
+def llm_node(state: ETLAgentSchema):
+    """
+    Ask the ETL agent what action should be taken next.
+
+    The LLM may either:
+
+    - call one of the available ETL tools
+    - return a final answer to the user
     """
 
-    final_answer = llm_bind.invoke(prompt)
-    state.messages = messages + [final_answer]
+    system_prompt = """
+You are an ETL specialist agent operating inside a larger
+Data Engineer agent.
 
-    return state
+Your responsibility is to perform ETL-related tasks.
+
+You have access to two tools:
+
+1. extract_load_tool
+
+   Use this when the user wants to extract data from an API
+   and save it locally.
+
+2. transform_load_tool
+
+   Use this when the user wants to clean, filter, aggregate,
+   reshape, transform, or otherwise modify an existing dataset.
+
+Rules:
+
+- Use the appropriate tool whenever the task requires an ETL operation.
+- Do not claim an operation succeeded unless a tool actually executed it.
+- If the user does not specify an extraction folder, use:
+  data/extract
+- If the user does not specify a transformation folder, use:
+  data/transform
+- If the user does not specify an output format, use:
+  csv
+- After the required tool operations are completed, provide a short,
+  clear summary of what was done.
+- Do not expose unnecessary implementation details.
+"""
+
+    conversation = [
+        {
+            "role": "system",
+            "content": system_prompt,
+        },
+        *state.messages,
+    ]
+
+    response = etl_llm_with_tools.invoke(
+        conversation
+    )
+
+    # Important:
+    # Because ETLAgentSchema uses LangGraph's add_messages reducer,
+    # we return ONLY the new message.
+    return {
+        "messages": [response]
+    }
 
 
 def tool_node(state: ETLAgentSchema):
     """
-    This node is responsible for invoking the appropriate tool based on the user's question and the context provided by the LLM.
+    Execute tool calls requested by the ETL LLM.
     """
 
-    tools_results = [] # that is gonna be filled with tool messages
+    last_message = state.messages[-1]
 
-    tools_by_name = {tool.name: tool for tool in tools}
-    tool_calls = state.messages[-1].tool_calls
+    tool_calls = getattr(
+        last_message,
+        "tool_calls",
+        [],
+    )
 
-    for tool_call in tool_calls: 
-        tool = tools_by_name[tool_call["name"]]
-        observation = tool.invoke(tool_call["args"])
+    tool_messages = []
 
-        tools_results.append(ToolMessage(content=observation, tool_call_id=tool_call["id"]))
+    for tool_call in tool_calls:
 
-    state.messages = state.messages + tools_results
+        tool_name = tool_call["name"]
 
-    return state
+        if tool_name not in tools_by_name:
+            tool_messages.append(
+                ToolMessage(
+                    content=f"Unknown tool requested: {tool_name}",
+                    tool_call_id=tool_call["id"],
+                )
+            )
+
+            continue
+
+        selected_tool = tools_by_name[
+            tool_name
+        ]
+
+        try:
+            result = selected_tool.invoke(
+                tool_call["args"]
+            )
+
+        except Exception as exc:
+            result = (
+                f"Tool execution failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        tool_messages.append(
+            ToolMessage(
+                content=str(result),
+                tool_call_id=tool_call["id"],
+            )
+        )
+
+    # Again, return ONLY the new messages.
+    return {
+        "messages": tool_messages
+    }
 
 
-def is_tool_call (state: ETLAgentSchema):
-    tool_calls = state.messages[-1].tool_calls
+# ============================================================
+# ROUTING
+# ============================================================
 
-    if tool_node: 
-        return "tool_node"
-    else: 
-        return "end"
+def route_after_llm(
+    state: ETLAgentSchema,
+) -> str:
+    """
+    Decide whether the agent should execute a tool
+    or finish the workflow.
+    """
 
+    last_message = state.messages[-1]
 
-# Nodes & Edges
-etl_analyst_graph = StateGraph(ETLAgentSchema)
-etl_analyst_graph.add_node("llm_node", llm_node)
-etl_analyst_graph.add_node("tool_node", tool_node)
-
-etl_analyst_graph.add_edge(START, "llm_node")
-
-def is_tool_call(state:ETLAgentSchema):
-    tool_calls = state.messages[-1].tool_calls
+    tool_calls = getattr(
+        last_message,
+        "tool_calls",
+        [],
+    )
 
     if tool_calls:
-        return "tool_node"
-    else:
-        return "end"
+        return "tools"
 
-etl_analyst_graph.add_conditional_edges(
-    "llm_node",is_tool_call,
-    {
-        "tool_node": "tool_node",
-        "end": END
-    }
+    return "end"
+
+
+# ============================================================
+# GRAPH
+# ============================================================
+
+etl_graph = StateGraph(
+    ETLAgentSchema
 )
 
-etl_analyst_graph.add_edge("tool_node", "llm_node")
+etl_graph.add_node(
+    "llm",
+    llm_node,
+)
 
-# we compile the graph here because we may need it for the data engineer agent
-etl_analyst = etl_analyst_graph.compile()
+etl_graph.add_node(
+    "tools",
+    tool_node,
+)
+
+
+etl_graph.add_edge(
+    START,
+    "llm",
+)
+
+
+etl_graph.add_conditional_edges(
+    "llm",
+    route_after_llm,
+    {
+        "tools": "tools",
+        "end": END,
+    },
+)
+
+
+etl_graph.add_edge(
+    "tools",
+    "llm",
+)
+
+
+etl_analyst = etl_graph.compile()
+
+
+# ============================================================
+# LOCAL TESTING
+# ============================================================
 
 if __name__ == "__main__":
-    
-    # Optional
-    from IPython.display import display, Image
-    img = Image(etl_analyst.get_graph().draw_mermaid_png())
-    with open("etl_analyst_graph.png", "wb") as f:
-        f.write(img.data)
 
-    # now let's check if it can extract data well 
-    # response = etl_analyst.invoke(
-    #    {"messages": [HumanMessage(content="I want to extract the data from the API endpoint 'https://pokeapi.co/api/v2/pokemon' and save it to data/extract folder in the csv format")]}
-    # )
+    from langchain_core.messages import HumanMessage
 
-    # response = etl_analyst.invoke(
-    #    {"messages": [HumanMessage(content=rf"""
-    #                        I want to transform the data stored in the 'C:\Users\This PC\Desktop\Data engineer agent\Data-enginner-agent\data\extract\extracted_data.csv'
-    #                        path and save the transformed data in the C:\Users\This PC\Desktop\Data engineer agent\Data-enginner-agent\data\transform' folder in the
-    #                        csv format. the transformation should filter the data to show bulbasaur pokemon only.
-    #    """)]}
-    # )
+    test_input = {
+        "messages": [
+            HumanMessage(
+                content=(
+                    "Extract the data from "
+                    "https://pokeapi.co/api/v2/pokemon "
+                    "and save it as CSV in data/extract."
+                )
+            )
+        ]
+    }
 
-    # print(response)
+    result = etl_analyst.invoke(
+        test_input
+    )
 
+    print("\n--- Final ETL Agent Response ---\n")
+
+    print(
+        result["messages"][-1].content
+    )
