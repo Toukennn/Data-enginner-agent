@@ -124,6 +124,8 @@ def tool_node(state: ETLAgentSchema):
 
     state.messages = state.messages + tools_results
 
+    return state
+
 
 def is_tool_call (state: ETLAgentSchema):
     tool_calls = state.messages[-1].tool_calls
